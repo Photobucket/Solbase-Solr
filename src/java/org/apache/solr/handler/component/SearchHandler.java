@@ -31,6 +31,7 @@ import java.util.concurrent.Future;
 import java.util.concurrent.SynchronousQueue;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
 import org.apache.commons.httpclient.HttpClient;
 import org.apache.commons.httpclient.MultiThreadedHttpConnectionManager;
@@ -357,7 +358,7 @@ class HttpCommComponent {
   // requests at some point (or should we simply return failure?)
   static Executor commExecutor = new ThreadPoolExecutor(
           0,
-          1000,
+          3000,
           5, TimeUnit.SECONDS, // terminate idle threads after 5 sec
           new SynchronousQueue<Runnable>()  // directly hand off tasks
   );
@@ -367,11 +368,12 @@ class HttpCommComponent {
 
   static {
     MultiThreadedHttpConnectionManager mgr = new MultiThreadedHttpConnectionManager();
-    mgr.getParams().setDefaultMaxConnectionsPerHost(20);
+    mgr.getParams().setDefaultMaxConnectionsPerHost(250); // There's JIRA ticket to parametize this val
     mgr.getParams().setMaxTotalConnections(10000);
     mgr.getParams().setConnectionTimeout(SearchHandler.connectionTimeout);
     mgr.getParams().setSoTimeout(SearchHandler.soTimeout);
-    // mgr.getParams().setStaleCheckingEnabled(false);
+    mgr.closeIdleConnections(500); // cleaning up idle connections
+    mgr.getParams().setStaleCheckingEnabled(true);
     client = new HttpClient(mgr);
   }
 

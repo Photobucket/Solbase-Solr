@@ -28,6 +28,7 @@ import java.util.HashSet;
 import java.util.LinkedList;
 import java.util.List;
 import java.util.Set;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 import org.apache.lucene.document.Document;
 import org.apache.lucene.document.FieldSelector;
@@ -916,176 +917,181 @@ public class SolrIndexSearcher extends IndexSearcher implements SolrInfoMBean {
 		if (terms.size() == 0) {
 			terms = null;
 		}
-		// we can try and look up the complete query in the cache.
-		// we can't do that if filter!=null though (we don't want to
-		// do hashCode() and equals() for a big DocSet).
-		if (queryResultCache != null && cmd.getFilter() == null) {
-			
-			// all of the current flags can be reused during warming,
-			// so set all of them on the cache key.
-			key = new QueryResultKey(cmd.getQuery(), cmd.getFilterList(),
-					cmd.getSort(), cmd.getFlags());
-			if ((cmd.getFlags() & NO_CHECK_QCACHE) == 0) {
-				
+		
+		try {
+			// we can try and look up the complete query in the cache.
+			// we can't do that if filter!=null though (we don't want to
+			// do hashCode() and equals() for a big DocSet).
+			if (queryResultCache != null && cmd.getFilter() == null) {
 
-				if (queryResultCache instanceof SolrCacheWithReader) {
-					if (terms != null) {
-						((SolrCacheWithReader)queryResultCache).setReader(reader.getWrappedReader());
-						superset = (DocList) ((SolrCacheWithReader)queryResultCache).get(key, terms);
-					} 
-				} else {
-					superset = (DocList) queryResultCache.get(key);
-				}
+				// all of the current flags can be reused during warming,
+				// so set all of them on the cache key.
+				key = new QueryResultKey(cmd.getQuery(), cmd.getFilterList(), cmd.getSort(), cmd.getFlags());
+				if ((cmd.getFlags() & NO_CHECK_QCACHE) == 0) {
 
-				// current query doesn't exist in our query result cache. so do full lucene lookup
-				if (superset != null) {
-					// check that the cache entry has scores recorded if we need
-					// them
-					if ((cmd.getFlags() & GET_SCORES) == 0
-							|| superset.hasScores()) {
-						// NOTE: subset() returns null if the DocList has fewer
-						// docs than
-						// requested
-						out.docList = superset.subset(cmd.getOffset(),
-								cmd.getLen());
-					}
-				}
-				if (out.docList != null) {
-					// found the docList in the cache... now check if we need
-					// the docset too.
-					// OPT: possible future optimization - if the doclist
-					// contains all the matches,
-					// use it to make the docset instead of rerunning the query.
-					if (out.docSet == null
-							&& ((cmd.getFlags() & GET_DOCSET) != 0)) {
-						if (cmd.getFilterList() == null) {
-							out.docSet = getDocSet(cmd.getQuery());
-						} else {
-							List<Query> newList = new ArrayList<Query>(cmd
-									.getFilterList().size() + 1);
-							newList.add(cmd.getQuery());
-							newList.addAll(cmd.getFilterList());
-							out.docSet = getDocSet(newList);
-						}
-					}
-					return;
-				}
-			}
-
-			// If we are going to generate the result, bump up to the
-			// next resultWindowSize for better caching.
-
-			// handle 0 special case as well as avoid idiv in the common case.
-			if (maxDocRequested < queryResultWindowSize) {
-				supersetMaxDoc = queryResultWindowSize;
-			} else {
-				supersetMaxDoc = ((maxDocRequested - 1) / queryResultWindowSize + 1)
-						* queryResultWindowSize;
-				if (supersetMaxDoc < 0)
-					supersetMaxDoc = maxDocRequested;
-			}
-		}
-
-		// OK, so now we need to generate an answer.
-		// One way to do that would be to check if we have an unordered list
-		// of results for the base query. If so, we can apply the filters and
-		// then
-		// sort by the resulting set. This can only be used if:
-		// - the sort doesn't contain score
-		// - we don't want score returned.
-
-		// check if we should try and use the filter cache
-		boolean useFilterCache = false;
-		if ((cmd.getFlags() & (GET_SCORES | NO_CHECK_FILTERCACHE)) == 0
-				&& useFilterForSortedQuery && cmd.getSort() != null
-				&& filterCache != null) {
-			useFilterCache = true;
-			SortField[] sfields = cmd.getSort().getSort();
-			for (SortField sf : sfields) {
-				if (sf.getType() == SortField.SCORE) {
-					useFilterCache = false;
-					break;
-				}
-			}
-		}
-
-		// disable useFilterCache optimization temporarily
-		if (useFilterCache) {
-			// now actually use the filter cache.
-			// for large filters that match few documents, this may be
-			// slower than simply re-executing the query.
-			if (out.docSet == null) {
-				out.docSet = getDocSet(cmd.getQuery(), cmd.getFilter());
-				DocSet bigFilt = getDocSet(cmd.getFilterList());
-				if (bigFilt != null)
-					out.docSet = out.docSet.intersection(bigFilt);
-			}
-			// todo: there could be a sortDocSet that could take a list of
-			// the filters instead of anding them first...
-			// perhaps there should be a multi-docset-iterator
-			superset = sortDocSet(out.docSet, cmd.getSort(), supersetMaxDoc);
-			out.docList = superset.subset(cmd.getOffset(), cmd.getLen());
-
-			// lastly, put the superset in the cache if the size is less than or
-			// equal
-			// to queryResultMaxDocsCached
-			if (key != null && superset.size() <= queryResultMaxDocsCached
-					&& !qr.isPartialResults()) {
-				
-				if (queryResultCache instanceof SolrCacheWithReader) {
-					if (terms != null) {
-						((SolrCacheWithReader)queryResultCache).put(key, superset, terms);
-					} 
-				} else {
-					queryResultCache.put(key, superset);
-				}
-			}
-		} else {
-			// do it the normal way...
-			// TODO: need to implement term locking here
-			
-			try {
-				if (queryResultCache instanceof SolrCacheWithReader) {
-					((SolrCacheWithReader) queryResultCache).acquireLock(terms);
-				}
-				cmd.setSupersetMaxDoc(supersetMaxDoc);
-				if ((cmd.getFlags() & GET_DOCSET) != 0) {
-					// this currently conflates returning the docset for the
-					// base
-					// query vs
-					// the base query and all filters.
-					DocSet qDocSet = getDocListAndSetNC(qr, cmd);
-					// cache the docSet matching the query w/o filtering
-					if (qDocSet != null && filterCache != null && !qr.isPartialResults())
-						filterCache.put(cmd.getQuery(), qDocSet);
-				} else {
-					getDocListNC(qr, cmd);
-					// Parameters:
-					// cmd.getQuery(),theFilt,cmd.getSort(),0,supersetMaxDoc,cmd.getFlags(),cmd.getTimeAllowed(),responseHeader);
-				}
-				
-				superset = out.docList;
-				out.docList = superset.subset(cmd.getOffset(), cmd.getLen());
-				
-				// lastly, put the superset in the cache if the size is less than or
-				// equal
-				// to queryResultMaxDocsCached
-				if (key != null && superset.size() <= queryResultMaxDocsCached
-						&& !qr.isPartialResults()) {
-					
 					if (queryResultCache instanceof SolrCacheWithReader) {
 						if (terms != null) {
-							((SolrCacheWithReader)queryResultCache).put(key, superset, terms);
-						} 
+							((SolrCacheWithReader) queryResultCache).setReader(reader.getWrappedReader());
+							superset = (DocList) ((SolrCacheWithReader) queryResultCache).get(key, terms);
+						}
+					} else {
+						superset = (DocList) queryResultCache.get(key);
+					}
+
+					// current query doesn't exist in our query result cache. so
+					// do full lucene lookup
+					if (superset != null) {
+						// check that the cache entry has scores recorded if we
+						// need
+						// them
+						if ((cmd.getFlags() & GET_SCORES) == 0 || superset.hasScores()) {
+							// NOTE: subset() returns null if the DocList has
+							// fewer
+							// docs than
+							// requested
+							out.docList = superset.subset(cmd.getOffset(), cmd.getLen());
+						}
+					}
+					if (out.docList != null) {
+						// found the docList in the cache... now check if we
+						// need
+						// the docset too.
+						// OPT: possible future optimization - if the doclist
+						// contains all the matches,
+						// use it to make the docset instead of rerunning the
+						// query.
+						if (out.docSet == null && ((cmd.getFlags() & GET_DOCSET) != 0)) {
+							if (cmd.getFilterList() == null) {
+								out.docSet = getDocSet(cmd.getQuery());
+							} else {
+								List<Query> newList = new ArrayList<Query>(cmd.getFilterList().size() + 1);
+								newList.add(cmd.getQuery());
+								newList.addAll(cmd.getFilterList());
+								out.docSet = getDocSet(newList);
+							}
+						}
+						return;
+					}
+				}
+
+				// If we are going to generate the result, bump up to the
+				// next resultWindowSize for better caching.
+
+				// handle 0 special case as well as avoid idiv in the common
+				// case.
+				if (maxDocRequested < queryResultWindowSize) {
+					supersetMaxDoc = queryResultWindowSize;
+				} else {
+					supersetMaxDoc = ((maxDocRequested - 1) / queryResultWindowSize + 1) * queryResultWindowSize;
+					if (supersetMaxDoc < 0)
+						supersetMaxDoc = maxDocRequested;
+				}
+			}
+
+			// OK, so now we need to generate an answer.
+			// One way to do that would be to check if we have an unordered list
+			// of results for the base query. If so, we can apply the filters
+			// and
+			// then
+			// sort by the resulting set. This can only be used if:
+			// - the sort doesn't contain score
+			// - we don't want score returned.
+
+			// check if we should try and use the filter cache
+			boolean useFilterCache = false;
+			if ((cmd.getFlags() & (GET_SCORES | NO_CHECK_FILTERCACHE)) == 0 && useFilterForSortedQuery && cmd.getSort() != null && filterCache != null) {
+				useFilterCache = true;
+				SortField[] sfields = cmd.getSort().getSort();
+				for (SortField sf : sfields) {
+					if (sf.getType() == SortField.SCORE) {
+						useFilterCache = false;
+						break;
+					}
+				}
+			}
+
+			// disable useFilterCache optimization temporarily
+			if (useFilterCache) {
+				// now actually use the filter cache.
+				// for large filters that match few documents, this may be
+				// slower than simply re-executing the query.
+				if (out.docSet == null) {
+					out.docSet = getDocSet(cmd.getQuery(), cmd.getFilter());
+					DocSet bigFilt = getDocSet(cmd.getFilterList());
+					if (bigFilt != null)
+						out.docSet = out.docSet.intersection(bigFilt);
+				}
+				// todo: there could be a sortDocSet that could take a list of
+				// the filters instead of anding them first...
+				// perhaps there should be a multi-docset-iterator
+				superset = sortDocSet(out.docSet, cmd.getSort(), supersetMaxDoc);
+				out.docList = superset.subset(cmd.getOffset(), cmd.getLen());
+
+				// lastly, put the superset in the cache if the size is less
+				// than or
+				// equal
+				// to queryResultMaxDocsCached
+				if (key != null && superset.size() <= queryResultMaxDocsCached && !qr.isPartialResults()) {
+
+					if (queryResultCache instanceof SolrCacheWithReader) {
+						if (terms != null) {
+							((SolrCacheWithReader) queryResultCache).put(key, superset, terms);
+						}
 					} else {
 						queryResultCache.put(key, superset);
 					}
 				}
-			} finally {
-				// TODO: hacky, it requires to always have SolrCacheWithReader configured on instance of Solbase
-				if (queryResultCache instanceof SolrCacheWithReader) {
-					((SolrCacheWithReader) queryResultCache).releaseLock(terms);
+			} else {
+				// do it the normal way...
+				// TODO: need to implement term locking here
+				try {
+					if (queryResultCache instanceof SolrCacheWithReader) {
+						((SolrCacheWithReader) queryResultCache).acquireLock(terms);
+					}
+					cmd.setSupersetMaxDoc(supersetMaxDoc);
+					if ((cmd.getFlags() & GET_DOCSET) != 0) {
+						// this currently conflates returning the docset for the
+						// base
+						// query vs
+						// the base query and all filters.
+						DocSet qDocSet = getDocListAndSetNC(qr, cmd);
+						// cache the docSet matching the query w/o filtering
+						if (qDocSet != null && filterCache != null && !qr.isPartialResults())
+							filterCache.put(cmd.getQuery(), qDocSet);
+					} else {
+						getDocListNC(qr, cmd);
+						// Parameters:
+						// cmd.getQuery(),theFilt,cmd.getSort(),0,supersetMaxDoc,cmd.getFlags(),cmd.getTimeAllowed(),responseHeader);
+					}
+
+					superset = out.docList;
+					out.docList = superset.subset(cmd.getOffset(), cmd.getLen());
+
+					// lastly, put the superset in the cache if the size is less
+					// than or
+					// equal
+					// to queryResultMaxDocsCached
+					if (key != null && superset.size() <= queryResultMaxDocsCached && !qr.isPartialResults()) {
+
+						if (queryResultCache instanceof SolrCacheWithReader) {
+							if (terms != null) {
+								((SolrCacheWithReader) queryResultCache).put(key, superset, terms);
+							}
+						} else {
+							queryResultCache.put(key, superset);
+						}
+					}
+				} finally {
+					// TODO: hacky, it requires to always have
+					// SolrCacheWithReader configured on instance of Solbase
+					if (queryResultCache instanceof SolrCacheWithReader) {
+						((SolrCacheWithReader) queryResultCache).releaseLock(terms);
+					}
 				}
+			}
+		} finally {
+			if (queryResultCache != null && queryResultCache instanceof SolrCacheWithReader) {
+				((SolrCacheWithReader) queryResultCache).flushThreadLocalCache();
 			}
 		}
 	}
